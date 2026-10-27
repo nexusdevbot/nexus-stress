@@ -19,6 +19,14 @@
 | `auto` | semua | Jalankan http→tcp→udp→post→hold→slowloris berurutan + laporan gabungan | paling gampang buat test manual |
 | `resolve` | — | Cek host lolos whitelist atau tidak | |
 
+### ☁️ Mode Cloudflare (domainmu yang dilindungi CF)
+| Mode | Fungsi |
+|---|---|
+| `cf-find` | Deteksi bocor IP asli di belakang Cloudflare (origin leak): resolve subdomain umum (mail, cpanel, origin, direct, ...) lalu probe apakah IP non-CF itu serve domainmu |
+| `cf-edge` | Ukur kekuatan edge Cloudflare (flood ke IP edge dengan Host header domainmu) |
+| `cf-direct` | **Bypass CF**: flood langsung ke IP origin (Host header domain) — skip proteksi edge sama sekali |
+| `cf-cookie` | Flood via CF dengan cookie clearance browsermu (`cf_clearance`) — nembus JS challenge |
+
 ## 🧱 Guardrail
 - Target **WAJIB** ada di `/root/.nexus-stress.allow` (boleh IP, CIDR, atau domain).
 - File itu otomatis dibuat saat run pertama — tinggal tambah infra milikmu di sana, satu per baris.
@@ -88,6 +96,24 @@ python3 /root/nexus-stress.py auto http://1.2.3.4:8080/ --time 8
 ```bash
 python3 /root/nexus-stress.py http http://127.0.0.1:8899/ --brutal --fast
 ```
+
+### 5. Uji domain yang diproteksi Cloudflare (milikmu)
+```bash
+# 1) deteksi bocor IP origin di belakang CF
+python3 /root/nexus-stress.py cf-find domainkamu.com
+
+# 2) ukur kekuatan edge CF
+python3 /root/nexus-stress.py cf-edge https://domainkamu.com/ --threads 20 --time 15
+
+# 3) BYPASS CF — tembak langsung IP origin (dapat dari cf-find)
+python3 /root/nexus-stress.py cf-direct https://domainkamu.com/ 1.2.3.4 --port 443 --tls --threads 50 --time 15
+
+# 4) nembus challenge JS pakai cookie clearance dari browser kamu
+#    (F12 -> Application -> Cookies -> copy cf_clearance dkk)
+python3 /root/nexus-stress.py cf-cookie https://domainkamu.com/ \
+  --cookie "cf_clearance=XXXX; __cf_bm=YYYY" --threads 20 --time 15
+```
+> Kasus nyata (domain CF milik sendiri): via edge CF cuma ~15 req/s, tapi `cf-direct` langsung origin **~770 req/s (52×)** → artinya origin belum difirewall. Fix: whitelist port 80/443 origin cuma untuk [IP Cloudflare](https://www.cloudflare.com/ips/).
 
 ## 📊 Contoh Output
 ```
