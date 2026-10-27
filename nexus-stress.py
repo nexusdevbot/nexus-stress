@@ -24,23 +24,12 @@ ALLOW_FILE = "/root/.nexus-stress.allow"
 PROGRAM = "nexus-stress/2.0"
 
 DEFAULT_ALLOW = """# Whitelist target milik sendiri (satu per baris: IP / CIDR / domain)
+# Contoh:
+#   203.0.113.10
+#   203.0.113.0/24
+#   serverkamu.com
 127.0.0.1
 localhost
-43.156.131.196
-116.212.73.51
-43.163.81.55
-213.163.206.177
-43.106.120.156
-66.33.22.222
-66.33.22.231
-66.33.22.235
-66.33.22.241
-66.33.22.246
-66.33.22.252
-147.139.247.145
-proxy.tunelnexus.biz.id
-tokonexus.com
-status.tokonexus.com
 """
 
 lock = threading.Lock()
